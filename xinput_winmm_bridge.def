@@ -1,0 +1,20 @@
+; Export layout matches the installed 64-bit System32 XInput 1.4 DLL.
+; Other functions forward to a local, unmodified copy named xinput1_4_system.dll.
+; Ordinals 6, 9, 11-99, 105-107 are absent from the installed DLL.
+LIBRARY xinput1_4
+EXPORTS
+    DllMain=xinput1_4_system.DllMain @1
+    XInputGetState @2
+    XInputSetState @3
+    XInputGetCapabilities @4
+    XInputEnable=xinput1_4_system.XInputEnable @5
+    XInputGetBatteryInformation=xinput1_4_system.XInputGetBatteryInformation @7
+    XInputGetKeystroke=xinput1_4_system.XInputGetKeystroke @8
+    XInputGetAudioDeviceIds=xinput1_4_system.XInputGetAudioDeviceIds @10
+    XInputOrdinal100=xinput1_4_system.#100 @100 NONAME
+    XInputOrdinal101=xinput1_4_system.#101 @101 NONAME
+    XInputOrdinal102=xinput1_4_system.#102 @102 NONAME
+    XInputOrdinal103=xinput1_4_system.#103 @103 NONAME
+    XInputOrdinal104=xinput1_4_system.#104 @104 NONAME
+    XInputOrdinal108=xinput1_4_system.#108 @108 NONAME
+    XInputOrdinal109=xinput1_4_system.#109 @109 NONAME
