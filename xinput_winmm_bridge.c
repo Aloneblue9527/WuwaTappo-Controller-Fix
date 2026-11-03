@@ -1,6 +1,6 @@
-/* Local-only XInput 1.4 proxy for a WinMM-compatible controller.
- * Build with xinput_winmm_bridge.def and a 64-bit Windows C toolchain.
- * No code runs in DllMain; system XInput is loaded by absolute System32 path.
+/* Local-only XInput 1.4 proxy for WinMM-compatible controllers (V2 Multi-Slot).
+ * Scans all WinMM slots (0..15) and merges with native XInput to prevent
+ * slot-shift failures and virtual controller short-circuiting.
  */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -9,6 +9,7 @@
 
 #define DEVICE_NOT_CONNECTED 1167UL
 #define JOY_RETURNALL_LOCAL 0x00ffUL
+#define MAX_WINMM_SLOTS 16U
 #define XINPUT_GAMEPAD_DPAD_UP 0x0001
 #define XINPUT_GAMEPAD_DPAD_DOWN 0x0002
 #define XINPUT_GAMEPAD_DPAD_LEFT 0x0004
@@ -105,14 +106,6 @@ static BOOL CALLBACK initialize(PINIT_ONCE once, PVOID param, PVOID *context) {
     return TRUE;
 }
 
-static BOOL read_joystick(JOYINFOEX_LOCAL *joy) {
-    if (!g_joy_get) return FALSE;
-    memset(joy, 0, sizeof(*joy));
-    joy->dwSize = sizeof(*joy);
-    joy->dwFlags = JOY_RETURNALL_LOCAL;
-    return g_joy_get(0, joy) == 0;
-}
-
 static GAMEPAD_LOCAL convert(const JOYINFOEX_LOCAL *joy) {
     static const WORD button_map[14] = {
         XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B,
@@ -129,7 +122,6 @@ static GAMEPAD_LOCAL convert(const JOYINFOEX_LOCAL *joy) {
     unsigned i;
     for (i = 0; i < 14; ++i)
         if (joy->dwButtons & (1UL << i)) out.wButtons |= button_map[i];
-    /* Typical DualSense WinMM mapping: digital L2/R2 are buttons 7/8. */
     if (joy->dwButtons & (1UL << 6)) out.bLeftTrigger = 255;
     if (joy->dwButtons & (1UL << 7)) out.bRightTrigger = 255;
     if (joy->dwPOV != 65535UL && joy->dwPOV < 36000UL) {
@@ -139,60 +131,96 @@ static GAMEPAD_LOCAL convert(const JOYINFOEX_LOCAL *joy) {
         if (angle >= 13500UL && angle <= 22500UL) out.wButtons |= XINPUT_GAMEPAD_DPAD_DOWN;
         if (angle >= 22500UL && angle <= 31500UL) out.wButtons |= XINPUT_GAMEPAD_DPAD_LEFT;
     }
-    /* This pet consumes buttons. Stick axes are deliberately left neutral. */
     return out;
 }
 
+/* Scans all WinMM slots 0..15 and merges button states from any connected controller */
+static BOOL read_all_joysticks(GAMEPAD_LOCAL *merged) {
+    UINT slot;
+    BOOL any_connected = FALSE;
+    memset(merged, 0, sizeof(*merged));
+    if (!g_joy_get) return FALSE;
+    for (slot = 0; slot < MAX_WINMM_SLOTS; ++slot) {
+        JOYINFOEX_LOCAL joy;
+        memset(&joy, 0, sizeof(joy));
+        joy.dwSize = sizeof(joy);
+        joy.dwFlags = JOY_RETURNALL_LOCAL;
+        if (g_joy_get(slot, &joy) == 0) {
+            GAMEPAD_LOCAL cur = convert(&joy);
+            any_connected = TRUE;
+            merged->wButtons |= cur.wButtons;
+            if (cur.bLeftTrigger > merged->bLeftTrigger)
+                merged->bLeftTrigger = cur.bLeftTrigger;
+            if (cur.bRightTrigger > merged->bRightTrigger)
+                merged->bRightTrigger = cur.bRightTrigger;
+        }
+    }
+    return any_connected;
+}
+
 DWORD WINAPI XInputGetState(DWORD index, STATE_LOCAL *state) {
-    DWORD result;
-    JOYINFOEX_LOCAL joy;
-    GAMEPAD_LOCAL gamepad;
+    DWORD real_rc;
+    STATE_LOCAL real_state;
+    GAMEPAD_LOCAL winmm_pad;
+    BOOL winmm_ok;
     if (!state) return ERROR_BAD_ARGUMENTS;
     InitOnceExecuteOnce(&g_once, initialize, NULL, NULL);
-    result = g_real_get ? g_real_get(index, state) : DEVICE_NOT_CONNECTED;
-    if (result == ERROR_SUCCESS || index != 0 || result != DEVICE_NOT_CONNECTED) return result;
-    if (!read_joystick(&joy)) {
+    if (index != 0) {
+        return g_real_get ? g_real_get(index, state) : DEVICE_NOT_CONNECTED;
+    }
+    memset(&real_state, 0, sizeof(real_state));
+    real_rc = g_real_get ? g_real_get(0, &real_state) : DEVICE_NOT_CONNECTED;
+    winmm_ok = read_all_joysticks(&winmm_pad);
+
+    if (real_rc != ERROR_SUCCESS && !winmm_ok) {
         AcquireSRWLockExclusive(&g_lock);
         g_was_connected = FALSE;
         ReleaseSRWLockExclusive(&g_lock);
-        return DEVICE_NOT_CONNECTED;
+        return real_rc;
     }
-    gamepad = convert(&joy);
+
+    if (real_rc == ERROR_SUCCESS) {
+        winmm_pad.wButtons |= real_state.Gamepad.wButtons;
+        if (real_state.Gamepad.bLeftTrigger > winmm_pad.bLeftTrigger)
+            winmm_pad.bLeftTrigger = real_state.Gamepad.bLeftTrigger;
+        if (real_state.Gamepad.bRightTrigger > winmm_pad.bRightTrigger)
+            winmm_pad.bRightTrigger = real_state.Gamepad.bRightTrigger;
+    }
+
     AcquireSRWLockExclusive(&g_lock);
-    if (!g_was_connected || memcmp(&gamepad, &g_previous, sizeof(gamepad)) != 0) {
+    if (!g_was_connected || memcmp(&winmm_pad, &g_previous, sizeof(winmm_pad)) != 0) {
         ++g_packet;
-        g_previous = gamepad;
+        g_previous = winmm_pad;
         g_was_connected = TRUE;
     }
     state->dwPacketNumber = g_packet;
     ReleaseSRWLockExclusive(&g_lock);
-    state->Gamepad = gamepad;
+    state->Gamepad = winmm_pad;
     return ERROR_SUCCESS;
 }
 
 DWORD WINAPI XInputGetCapabilities(DWORD index, DWORD flags, CAPS_LOCAL *caps) {
     DWORD result;
-    JOYINFOEX_LOCAL joy;
+    GAMEPAD_LOCAL dummy;
     if (!caps) return ERROR_BAD_ARGUMENTS;
     InitOnceExecuteOnce(&g_once, initialize, NULL, NULL);
     result = g_real_caps ? g_real_caps(index, flags, caps) : DEVICE_NOT_CONNECTED;
     if (result == ERROR_SUCCESS || index != 0 || result != DEVICE_NOT_CONNECTED) return result;
     if (flags != 0 && flags != 1) return ERROR_BAD_ARGUMENTS;
-    if (!read_joystick(&joy)) return DEVICE_NOT_CONNECTED;
+    if (!read_all_joysticks(&dummy)) return DEVICE_NOT_CONNECTED;
     memset(caps, 0, sizeof(*caps));
     caps->Type = 1; caps->SubType = 1;
-    caps->Gamepad.wButtons = 0xf3ff; /* d-pad, start/back, sticks, shoulders, ABXY */
+    caps->Gamepad.wButtons = 0xf3ff;
     caps->Gamepad.bLeftTrigger = caps->Gamepad.bRightTrigger = 255;
     return ERROR_SUCCESS;
 }
 
 DWORD WINAPI XInputSetState(DWORD index, VIBRATION_LOCAL *vibration) {
     DWORD result;
-    JOYINFOEX_LOCAL joy;
+    GAMEPAD_LOCAL dummy;
     if (!vibration) return ERROR_BAD_ARGUMENTS;
     InitOnceExecuteOnce(&g_once, initialize, NULL, NULL);
     result = g_real_set ? g_real_set(index, vibration) : DEVICE_NOT_CONNECTED;
     if (result == ERROR_SUCCESS || index != 0 || result != DEVICE_NOT_CONNECTED) return result;
-    /* WinMM does not provide an equivalent rumble API. Treat as a no-op. */
-    return read_joystick(&joy) ? ERROR_SUCCESS : DEVICE_NOT_CONNECTED;
+    return read_all_joysticks(&dummy) ? ERROR_SUCCESS : DEVICE_NOT_CONNECTED;
 }
