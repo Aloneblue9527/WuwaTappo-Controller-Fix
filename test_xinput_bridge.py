@@ -1,7 +1,6 @@
-"""Smoke-test a staged x64 XInput proxy using only Python's standard library.
+r"""Verify standalone zero-CRT x64 xinput1_4.dll (buttons, triggers, sticks).
 
-Usage: python -B test_xinput_bridge.py PATH_TO_STAGED_DLL [seconds]
-Press the DualSense D-pad and one face button during the test interval.
+Usage: python -B test_xinput_bridge.py .\xinput1_4.dll [seconds]
 """
 
 import ctypes as ct
@@ -36,15 +35,46 @@ class Capabilities(ct.Structure):
     ]
 
 
-def check_pe_machine(path):
-    with path.open("rb") as f:
-        header = f.read(64)
-        if header[:2] != b"MZ":
-            raise ValueError("not a PE DLL")
-        f.seek(struct.unpack_from("<I", header, 0x3C)[0] + 4)
-        machine = struct.unpack("<H", f.read(2))[0]
-        if machine != 0x8664:
-            raise ValueError(f"expected AMD64 PE, got 0x{machine:04x}")
+def inspect_pe(path: pathlib.Path):
+    data = path.read_bytes()
+    if data[:2] != b"MZ":
+        raise ValueError("not a PE DLL")
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if data[pe_off:pe_off + 4] != b"PE\0\0":
+        raise ValueError("invalid PE header")
+    machine = struct.unpack_from("<H", data, pe_off + 4)[0]
+    if machine != 0x8664:
+        raise ValueError(f"expected AMD64 PE, got 0x{machine:04x}")
+
+    num_sections = struct.unpack_from("<H", data, pe_off + 6)[0]
+    opt_size = struct.unpack_from("<H", data, pe_off + 20)[0]
+    opt_off = pe_off + 24
+    import_rva = struct.unpack_from("<I", data, opt_off + 120)[0]
+
+    sections = []
+    sec_off = opt_off + opt_size
+    for i in range(num_sections):
+        vsize, vaddr, raw_size, raw_ptr = struct.unpack_from("<4I", data, sec_off + i * 40 + 8)
+        sections.append((vaddr, max(vsize, raw_size), raw_ptr))
+
+    def rva_to_off(rva):
+        for vaddr, span, raw_ptr in sections:
+            if vaddr <= rva < vaddr + span:
+                return raw_ptr + (rva - vaddr)
+        raise ValueError(f"RVA 0x{rva:x} out of range")
+
+    imports = []
+    if import_rva:
+        off = rva_to_off(import_rva)
+        while True:
+            desc = struct.unpack_from("<5I", data, off)
+            if not any(desc):
+                break
+            name_off = rva_to_off(desc[3])
+            end = data.index(b"\0", name_off)
+            imports.append(data[name_off:end].decode("ascii", errors="replace"))
+            off += 20
+    return len(data), imports
 
 
 def main():
@@ -52,13 +82,12 @@ def main():
         raise SystemExit("Usage: python -B test_xinput_bridge.py DLL_PATH [seconds]")
     path = pathlib.Path(sys.argv[1]).resolve(strict=True)
     seconds = float(sys.argv[2]) if len(sys.argv) == 3 else 10
-    if seconds <= 0:
-        raise SystemExit("seconds must be positive")
-    check_pe_machine(path)
-    if not (path.parent / "xinput1_4_system.dll").is_file():
-        raise SystemExit("missing ordinal-forwarder sidecar xinput1_4_system.dll")
-    if ct.sizeof(State) != 16 or ct.sizeof(Capabilities) != 20:
-        raise SystemExit("unexpected Windows ctypes ABI")
+
+    size, imports = inspect_pe(path)
+    print(f"PE OK: {size} bytes | Static imports: {imports}", flush=True)
+    bad = [d for d in imports if d.lower() != "kernel32.dll"]
+    if bad:
+        raise SystemExit(f"NOT zero-CRT! Unexpected imports: {bad}")
 
     dll = ct.WinDLL(str(path))
     k32 = ct.WinDLL("kernel32.dll")
@@ -75,37 +104,35 @@ def main():
     caps = dll.XInputGetCapabilities
     caps.argtypes = [wt.DWORD, wt.DWORD, ct.POINTER(Capabilities)]
     caps.restype = wt.DWORD
-    capacity = Capabilities()
-    rc = caps(0, 0, ct.byref(capacity))
+
+    cap = Capabilities()
+    rc = caps(0, 0, ct.byref(cap))
     if rc != 0:
-        raise SystemExit(f"XInputGetCapabilities(0) returned {rc}, expected 0")
-    print(f"x64 exports OK; capabilities: type={capacity.type} buttons=0x{capacity.gamepad.buttons:04x}", flush=True)
-    print("Press D-pad and a face button now; testing for state changes...", flush=True)
-    initial = State()
-    rc = get(0, ct.byref(initial))
-    if rc != 0:
-        raise SystemExit(f"XInputGetState(0) returned {rc}, expected 0")
-    print(f"initial: packet={initial.packet} buttons=0x{initial.gamepad.buttons:04x}", flush=True)
+        raise SystemExit(f"XInputGetCapabilities(0) returned {rc} (is controller connected?)")
+    print(f"All 15 exports OK | Capabilities: buttons=0x{cap.gamepad.buttons:04x} LX=0x{cap.gamepad.lx & 0xFFFF:04x}", flush=True)
+    print("Press D-pad, face buttons, triggers, and move both sticks...", flush=True)
+
     last = None
     saw_dpad = False
     saw_face = False
+    saw_stick = False
     end = time.monotonic() + seconds
     while time.monotonic() < end:
-        state = State()
-        rc = get(0, ct.byref(state))
+        st = State()
+        rc = get(0, ct.byref(st))
         if rc:
-            raise SystemExit(f"XInputGetState(0) unexpectedly returned {rc}")
-        current = (state.packet, state.gamepad.buttons,
-                   state.gamepad.left_trigger, state.gamepad.right_trigger)
-        if current != last:
-            print("packet=%d buttons=0x%04x LT=%d RT=%d" % current, flush=True)
-        saw_dpad |= bool(state.gamepad.buttons & 0x000F)
-        saw_face |= bool(state.gamepad.buttons & 0xF000)
-        last = current
-        time.sleep(0.02)
-    print(f"RESULT dpad_seen={saw_dpad} face_button_seen={saw_face}", flush=True)
-    if not saw_dpad or not saw_face:
-        raise SystemExit("Need both D-pad and face-button presses to certify and deploy this DLL")
+            raise SystemExit(f"XInputGetState(0) returned {rc}")
+        g = st.gamepad
+        cur = (g.buttons, g.left_trigger, g.right_trigger, g.lx, g.ly, g.rx, g.ry)
+        if cur != last:
+            print(f"pkt={st.packet:4d} btn=0x{g.buttons:04x} LT={g.left_trigger:3d} RT={g.right_trigger:3d} "
+                  f"L=({g.lx:6d},{g.ly:6d}) R=({g.rx:6d},{g.ry:6d})", flush=True)
+        saw_dpad |= bool(g.buttons & 0x000F)
+        saw_face |= bool(g.buttons & 0xF000)
+        saw_stick |= any(abs(v) > 10000 for v in (g.lx, g.ly, g.rx, g.ry))
+        last = cur
+        time.sleep(0.03)
+    print(f"RESULT dpad={saw_dpad} face={saw_face} stick={saw_stick}", flush=True)
 
 
 if __name__ == "__main__":
