@@ -5,7 +5,7 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue?logo=windows)](https://www.microsoft.com/windows)
 [![Game](https://img.shields.io/badge/Game-鸣潮%20Wuthering%20Waves-6f42c1)](https://mc.kurogames.com/)
-[![Version](https://img.shields.io/badge/Version-V2-orange)]()
+[![Version](https://img.shields.io/badge/Version-V3-orange)]()
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
